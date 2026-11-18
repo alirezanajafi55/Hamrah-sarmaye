@@ -1,3 +1,4 @@
+
 name: Build Android APK
 
 on:
@@ -9,6 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,16 +23,22 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
 
       - name: Extract Android source
         run: |
           mkdir -p source
           unzip -q hamrah_sarmaye_v0.3.5_provider_compat_source.zip -d source
+
           GRADLEW="$(find source -type f -name gradlew -print -quit)"
+
           if [ -z "$GRADLEW" ]; then
             echo "gradlew was not found"
             exit 1
           fi
+
           echo "PROJECT_DIR=$(dirname "$GRADLEW")" >> "$GITHUB_ENV"
 
       - name: Build debug APK
