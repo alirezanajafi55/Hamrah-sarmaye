@@ -43,6 +43,7 @@ jobs:
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          export PROJECT_DIR
           echo "Project directory: $PROJECT_DIR"
 
           echo "Gradle configuration files:"
