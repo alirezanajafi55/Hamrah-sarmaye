@@ -27,25 +27,99 @@ jobs:
           packages: |
             platform-tools
 
-      - name: Extract Android source
+      - name: Extract source and detect Gradle
+        id: project
+        shell: bash
         run: |
           mkdir -p source
           unzip -q hamrah_sarmaye_v0.3.5_provider_compat_source.zip -d source
 
-          GRADLEW="$(find source -type f -name gradlew -print -quit)"
+          PROJECT_DIR="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)"
 
-          if [ -z "$GRADLEW" ]; then
-            echo "gradlew was not found"
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::Gradle settings file not found"
+            find source -maxdepth 4 -type f
             exit 1
           fi
 
-          echo "PROJECT_DIR=$(dirname "$GRADLEW")" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $PROJECT_DIR"
+
+          echo "Gradle configuration files:"
+          find "$PROJECT_DIR" -maxdepth 4 -type f \( -name '*.gradle' -o -name '*.gradle.kts' -o -name '*.toml' -o -name 'gradle.properties' \) -print
+
+          python3 - <<'PY'
+          import os, re, glob, sys
+
+          root = os.environ["PROJECT_DIR"]
+          files = []
+          for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
+              files += glob.glob(os.path.join(root, pattern), recursive=True)
+
+          version = None
+          for path in files:
+              try:
+                  content = open(path, encoding="utf-8").read()
+              except Exception:
+                  continue
+
+              patterns = [
+                  r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+                  r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+                  r'com\.android\.(?:application|library)[\s\S]{0,150}?version\s*["\'](\d+\.\d+(?:\.\d+)?)["\']'
+              ]
+
+              for pattern in patterns:
+                  match = re.search(pattern, content)
+                  if match:
+                      version = match.group(1)
+                      break
+              if version:
+                  break
+
+          print("Detected Android Gradle Plugin:", version or "NOT FOUND")
+
+          if not version:
+              sys.exit("Could not detect Android Gradle Plugin version")
+
+          major_minor = ".".join(version.split(".")[:2])
+
+          versions = {
+              "8.0": "8.0",
+              "8.1": "8.0",
+              "8.2": "8.2",
+              "8.3": "8.4",
+              "8.4": "8.6",
+              "8.5": "8.7",
+              "8.6": "8.7",
+              "8.7": "8.9",
+              "8.8": "8.10.2",
+              "8.9": "8.11.1",
+              "8.10": "8.11.1",
+              "8.11": "8.13",
+              "8.12": "8.13",
+              "8.13": "8.13"
+          }
+
+          gradle = versions.get(major_minor)
+          if not gradle:
+              sys.exit("No configured Gradle version for AGP " + version)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("gradle_version=" + gradle + "\n")
+
+          print("Selected Gradle version:", gradle)
+          PY
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.project.outputs.gradle_version }}
 
       - name: Build debug APK
         run: |
           cd "$PROJECT_DIR"
-          chmod +x ./gradlew
-          ./gradlew --no-daemon assembleDebug
+          gradle --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
