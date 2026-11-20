@@ -1,4 +1,3 @@
-
 name: Build Android APK
 
 on:
@@ -31,19 +30,30 @@ jobs:
         id: project
         shell: bash
         run: |
+          set -e
+
+          SOURCE_ZIP="hamrah_sarmaye_v0.3.7_source_root.zip"
+
+          if [ ! -f "$SOURCE_ZIP" ]; then
+            echo "::error::Source ZIP not found: $SOURCE_ZIP"
+            ls -lh *.zip || true
+            exit 1
+          fi
+
           mkdir -p source
-          unzip -q hamrah_sarmaye_v0.3.5_provider_compat_source.zip -d source
+          unzip -q "$SOURCE_ZIP" -d source
 
           PROJECT_DIR="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)"
 
           if [ -z "$PROJECT_DIR" ]; then
             echo "::error::Gradle settings file not found"
-            find source -maxdepth 4 -type f
+            find source -maxdepth 5 -type f
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           export PROJECT_DIR
+
           echo "Project directory: $PROJECT_DIR"
 
           echo "Gradle configuration files:"
@@ -54,27 +64,30 @@ jobs:
 
           root = os.environ["PROJECT_DIR"]
           files = []
+
           for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
               files += glob.glob(os.path.join(root, pattern), recursive=True)
 
           version = None
+
+          patterns = [
+              r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+              r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+              r'com\.android\.(?:application|library)[\s\S]{0,150}?version\s*["\'](\d+\.\d+(?:\.\d+)?)["\']'
+          ]
+
           for path in files:
               try:
                   content = open(path, encoding="utf-8").read()
               except Exception:
                   continue
 
-              patterns = [
-                  r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
-                  r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
-                  r'com\.android\.(?:application|library)[\s\S]{0,150}?version\s*["\'](\d+\.\d+(?:\.\d+)?)["\']'
-              ]
-
               for pattern in patterns:
                   match = re.search(pattern, content)
                   if match:
                       version = match.group(1)
                       break
+
               if version:
                   break
 
@@ -103,6 +116,7 @@ jobs:
           }
 
           gradle = versions.get(major_minor)
+
           if not gradle:
               sys.exit("No configured Gradle version for AGP " + version)
 
@@ -117,10 +131,26 @@ jobs:
         with:
           gradle-version: ${{ steps.project.outputs.gradle_version }}
 
-      - name: Build debug APK
+      - name: Align Java and Kotlin JVM targets
+        shell: bash
         run: |
-          cd "$PROJECT_DIR"
-          gradle --no-daemon assembleDebug
+          cat > "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" <<'EOF'
+          allprojects {
+              tasks.configureEach { task ->
+                  if (task.name.toLowerCase().contains("kotlin") &&
+                      task.hasProperty("kotlinOptions")) {
+                      task.kotlinOptions.jvmTarget = "1.8"
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          gradle --no-daemon \
+            --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
+            assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
