@@ -27,12 +27,14 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses
+          yes | sdkmanager --licenses || true
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
@@ -60,8 +62,7 @@ jobs:
           SETTINGS_FILE="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Gradle settings file not found in source ZIP"
-            find source -maxdepth 5 -type f
+            echo "::error::Gradle settings file not found"
             exit 1
           fi
 
@@ -69,10 +70,7 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           python3 - "$PROJECT_DIR" <<'PY'
-          import os
-          import re
-          import glob
-          import sys
+          import os, re, glob, sys
 
           root = sys.argv[1]
           files = []
@@ -80,13 +78,13 @@ jobs:
           for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
               files.extend(glob.glob(os.path.join(root, pattern), recursive=True))
 
-          version = None
-
           patterns = [
               r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
               r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
               r'com\.android\.(?:application|library)[\s\S]{0,150}?version\s*["\'](\d+\.\d+(?:\.\d+)?)["\']'
           ]
+
+          version = None
 
           for path in files:
               try:
@@ -106,7 +104,7 @@ jobs:
           if not version:
               sys.exit("Could not detect Android Gradle Plugin version")
 
-          major_minor = ".".join(version.split(".")[:2])
+          key = ".".join(version.split(".")[:2])
 
           versions = {
               "8.0": "8.0",
@@ -125,7 +123,7 @@ jobs:
               "8.13": "8.13"
           }
 
-          gradle = versions.get(major_minor)
+          gradle = versions.get(key)
 
           if not gradle:
               sys.exit("No configured Gradle version for AGP " + version)
@@ -172,10 +170,10 @@ jobs:
           echo "Android project structure verified."
 
       - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
+          cd "$PROJECT_DIR"
 
           gradle --no-daemon \
             --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
@@ -222,7 +220,6 @@ jobs:
             set -euo pipefail
 
             mkdir -p "$RUNNER_TEMP/hamrah-device-test"
-
             LOG="$RUNNER_TEMP/hamrah-device-test/logcat.txt"
 
             trap 'adb logcat -d > "$LOG" 2>&1 || true' EXIT
@@ -230,7 +227,6 @@ jobs:
             adb wait-for-device
 
             BOOTED=0
-
             for attempt in $(seq 1 60); do
               BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
               [ "$BOOTED" = "1" ] && break
@@ -243,17 +239,14 @@ jobs:
             fi
 
             adb install -r "$APK_PATH"
-
             adb shell am force-stop com.hamrahsarmaye.app || true
 
             START_OUTPUT="$(adb shell am start -W -n com.hamrahsarmaye.app/.MainActivity 2>&1)"
-
             printf '%s\n' "$START_OUTPUT"
 
             printf '%s\n' "$START_OUTPUT" | grep -q "Status: ok"
 
             sleep 12
-
             adb shell pidof com.hamrahsarmaye.app
 
             adb logcat -d -s AndroidRuntime:E \
