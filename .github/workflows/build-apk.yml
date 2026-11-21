@@ -1,5 +1,4 @@
-
-name: Build Android APK
+name: Build Android APK and verify install
 
 on:
   workflow_dispatch:
@@ -11,9 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  build-and-device-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -30,6 +29,10 @@ jobs:
         with:
           packages: |
             platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+            emulator
+            system-images;android-35;google_apis;x86_64
 
       - name: Extract source and detect Gradle
         id: project
@@ -38,7 +41,6 @@ jobs:
           set -euo pipefail
 
           SOURCE_ZIP="hamrah_sarmaye_v0.3.7_source_root_fixed.zip"
-
           if [ ! -f "$SOURCE_ZIP" ]; then
             echo "::error::Source ZIP not found: $SOURCE_ZIP"
             ls -lh *.zip || true
@@ -47,9 +49,7 @@ jobs:
 
           mkdir -p source
           unzip -q "$SOURCE_ZIP" -d source
-
           PROJECT_DIR="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)"
-
           if [ -z "$PROJECT_DIR" ]; then
             echo "::error::Gradle settings file not found"
             find source -maxdepth 5 -type f
@@ -59,19 +59,15 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           export PROJECT_DIR
 
-          echo "Project directory: $PROJECT_DIR"
-
           python3 - <<'PY'
           import os, re, glob, sys
 
           root = os.environ["PROJECT_DIR"]
           files = []
-
           for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
               files += glob.glob(os.path.join(root, pattern), recursive=True)
 
           version = None
-
           patterns = [
               r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
               r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
@@ -80,51 +76,35 @@ jobs:
 
           for path in files:
               try:
-                  content = open(path, encoding="utf-8").read()
+                  data = open(path, encoding="utf-8").read()
               except Exception:
                   continue
-
               for pattern in patterns:
-                  match = re.search(pattern, content)
+                  match = re.search(pattern, data)
                   if match:
                       version = match.group(1)
                       break
-
               if version:
                   break
 
           print("Detected Android Gradle Plugin:", version or "NOT FOUND")
-
           if not version:
               sys.exit("Could not detect Android Gradle Plugin version")
 
           major_minor = ".".join(version.split(".")[:2])
-
           versions = {
-              "8.0": "8.0",
-              "8.1": "8.0",
-              "8.2": "8.2",
-              "8.3": "8.4",
-              "8.4": "8.6",
-              "8.5": "8.7",
-              "8.6": "8.7",
-              "8.7": "8.9",
-              "8.8": "8.10.2",
-              "8.9": "8.11.1",
-              "8.10": "8.11.1",
-              "8.11": "8.13",
-              "8.12": "8.13",
-              "8.13": "8.13"
+              "8.0": "8.0", "8.1": "8.0", "8.2": "8.2",
+              "8.3": "8.4", "8.4": "8.6", "8.5": "8.7",
+              "8.6": "8.7", "8.7": "8.9", "8.8": "8.10.2",
+              "8.9": "8.11.1", "8.10": "8.11.1", "8.11": "8.13",
+              "8.12": "8.13", "8.13": "8.13"
           }
-
           gradle = versions.get(major_minor)
-
           if not gradle:
               sys.exit("No configured Gradle version for AGP " + version)
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write("gradle_version=" + gradle + "\n")
-
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("gradle_version=" + gradle + "\n")
           print("Selected Gradle version:", gradle)
           PY
 
@@ -164,10 +144,72 @@ jobs:
             --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
             clean assembleDebug
 
-      - name: Upload APK
+          APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK_PATH"
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          ls -lh "$APK_PATH"
+
+      - name: Verify APK signature and package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          test -x "$APKSIGNER"
+          test -x "$AAPT"
+          "$APKSIGNER" verify --verbose --print-certs "$APK_PATH"
+          "$AAPT" dump badging "$APK_PATH" > "$RUNNER_TEMP/badging.txt"
+          head -n 8 "$RUNNER_TEMP/badging.txt"
+
+      - name: Install and launch on Android 15 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+          disable-animations: true
+          script: |
+            set -euo pipefail
+            mkdir -p "$RUNNER_TEMP/hamrah-device-test"
+            LOG="$RUNNER_TEMP/hamrah-device-test/logcat.txt"
+            trap 'adb logcat -d > "$LOG" 2>&1 || true' EXIT
+
+            adb wait-for-device
+            for attempt in $(seq 1 60); do
+              BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+              [ "$BOOTED" = "1" ] && break
+              sleep 2
+            done
+            [ "${BOOTED:-0}" = "1" ]
+
+            adb install -r "$APK_PATH"
+            adb shell am force-stop com.hamrahsarmaye.app || true
+
+            START_OUTPUT="$(adb shell am start -W -n com.hamrahsarmaye.app/.MainActivity 2>&1)"
+            printf '%s\n' "$START_OUTPUT"
+            printf '%s\n' "$START_OUTPUT" | grep -q 'Status: ok'
+
+            sleep 12
+            adb shell pidof com.hamrahsarmaye.app
+
+            adb logcat -d -s AndroidRuntime:E > "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
+            if grep -q 'FATAL EXCEPTION' "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"; then
+              echo "::error::App launch produced a fatal runtime exception."
+              cat "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
+              exit 1
+            fi
+
+            echo "INSTALL_AND_LAUNCH_TEST=PASSED" | tee "$RUNNER_TEMP/hamrah-device-test/result.txt"
+
+      - name: Collect APK and device-test logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hamrah-sarmaye-v0.3.7-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          name: hamrah-sarmaye-apk-and-install-test
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+            ${{ runner.temp }}/hamrah-device-test/
+          if-no-files-found: warn
           retention-days: 14
