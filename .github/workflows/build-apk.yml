@@ -1,294 +1,1033 @@
-
-name: Build Android APK and verify install
-
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  build-and-device-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
-
-      - name: Install Android SDK packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses || true
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "emulator" \
-            "system-images;android-35;google_apis;x86_64"
-
-      - name: Extract source and detect Gradle
-        id: project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SOURCE_ZIP="hamrah_sarmaye_v0.3.7_source_root_fixed.zip"
-
-          if [ ! -f "$SOURCE_ZIP" ]; then
-            echo "::error::Source ZIP not found: $SOURCE_ZIP"
-            ls -lh *.zip || true
-            exit 1
-          fi
-
-          mkdir -p source
-          unzip -q "$SOURCE_ZIP" -d source
-
-          SETTINGS_FILE="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
-
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::Gradle settings file not found"
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          python3 - "$PROJECT_DIR" <<'PY'
-          import os, re, glob, sys
-
-          root = sys.argv[1]
-          files = []
-
-          for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
-              files.extend(glob.glob(os.path.join(root, pattern), recursive=True))
-
-          patterns = [
-              r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
-              r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
-              r'com\.android\.(?:application|library)[\s\S]{0,150}?version\s*["\'](\d+\.\d+(?:\.\d+)?)["\']'
-          ]
-
-          version = None
-
-          for path in files:
-              try:
-                  data = open(path, encoding="utf-8").read()
-              except Exception:
-                  continue
-
-              for pattern in patterns:
-                  match = re.search(pattern, data)
-                  if match:
-                      version = match.group(1)
-                      break
-
-              if version:
-                  break
-
-          if not version:
-              sys.exit("Could not detect Android Gradle Plugin version")
-
-          key = ".".join(version.split(".")[:2])
-
-          versions = {
-              "8.0": "8.0",
-              "8.1": "8.0",
-              "8.2": "8.2",
-              "8.3": "8.4",
-              "8.4": "8.6",
-              "8.5": "8.7",
-              "8.6": "8.7",
-              "8.7": "8.9",
-              "8.8": "8.10.2",
-              "8.9": "8.11.1",
-              "8.10": "8.11.1",
-              "8.11": "8.13",
-              "8.12": "8.13",
-              "8.13": "8.13"
-          }
-
-          gradle = versions.get(key)
-
-          if not gradle:
-              sys.exit("No configured Gradle version for AGP " + version)
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("gradle_version=" + gradle + "\n")
-
-          print("Detected AGP:", version)
-          print("Selected Gradle:", gradle)
-          PY
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: ${{ steps.project.outputs.gradle_version }}
-
-      - name: Align Kotlin JVM target
-        shell: bash
-        run: |
-          cat > "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" <<'EOF'
-          allprojects {
-              tasks.configureEach { task ->
-                  if (task.name.toLowerCase().contains("kotlin") &&
-                      task.hasProperty("kotlinOptions")) {
-                      task.kotlinOptions.jvmTarget = "1.8"
-                  }
-              }
-          }
-          EOF
-
-      - name: Verify Android project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
-
-          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
-            echo "::error::App Gradle file not found"
-            exit 1
-          fi
-
-          echo "Android project structure verified."
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          gradle --no-daemon \
-            --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
-            clean assembleDebug
-
-          APK_PATH="$PWD/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -s "$APK_PATH" ]; then
-            echo "::error::APK file was not generated"
-            echo "Expected APK path: $APK_PATH"
-            echo "Searching for generated APK files:"
-            find "$PWD" -type f -name "*.apk" -print || true
-            exit 1
-          fi
-
-          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
-          ls -lh "$APK_PATH"
-
-      - name: Verify APK signature and package
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
-
-          test -x "$APKSIGNER"
-          test -x "$AAPT"
-
-          "$APKSIGNER" verify --verbose --print-certs "$APK_PATH"
-
-          "$AAPT" dump badging "$APK_PATH" \
-            > "$RUNNER_TEMP/apk-badging.txt"
-
-          head -n 10 "$RUNNER_TEMP/apk-badging.txt"
-
-      - name: Prepare emulator test script
-        shell: bash
-        run: |
-          cat > "$RUNNER_TEMP/hamrah-emulator-test.sh" <<'EMULATOR_SCRIPT'
-          set -euo pipefail
-
-          mkdir -p "$RUNNER_TEMP/hamrah-device-test"
-          LOG="$RUNNER_TEMP/hamrah-device-test/logcat.txt"
-
-          trap 'adb logcat -d > "$LOG" 2>&1 || true' EXIT
-
-          adb wait-for-device
-
-          BOOTED=0
-          for attempt in $(seq 1 60); do
-            BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
-            [ "$BOOTED" = "1" ] && break
-            sleep 2
-          done
-
-          if [ "$BOOTED" != "1" ]; then
-            echo "::error::Android emulator did not finish booting"
-            exit 1
-          fi
-
-          if [ ! -s "$APK_PATH" ]; then
-            echo "::error::APK file not found: $APK_PATH"
-            exit 1
-          fi
-
-          adb install -r "$APK_PATH"
-          adb shell am force-stop com.hamrahsarmaye.app || true
-
-          START_OUTPUT="$(adb shell am start -W -n com.hamrahsarmaye.app/.MainActivity 2>&1)"
-          printf '%s\n' "$START_OUTPUT"
-
-          printf '%s\n' "$START_OUTPUT" | grep -q "Status: ok"
-
-          sleep 12
-          adb shell pidof com.hamrahsarmaye.app
-
-          adb logcat -d -s AndroidRuntime:E \
-            > "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
-
-          if grep -q "FATAL EXCEPTION" \
-            "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"; then
-            echo "::error::App launch produced a fatal exception"
-            cat "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
-            exit 1
-          fi
-
-          echo "INSTALL_AND_LAUNCH_TEST=PASSED" \
-            | tee "$RUNNER_TEMP/hamrah-device-test/result.txt"
-          EMULATOR_SCRIPT
-
-          chmod +x "$RUNNER_TEMP/hamrah-emulator-test.sh"
-
-      - name: Install and launch on Android emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        env:
-          ANDROID_I_WANT_MY_TCG: "yes"
-        with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          profile: pixel_2
-          emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
-          disable-animations: true
-          emulator-boot-timeout: 900
-          script: bash "$RUNNER_TEMP/hamrah-emulator-test.sh"
-
-      - name: Upload APK and test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hamrah-sarmaye-apk-and-install-test
-          path: |
-            source/**/app/build/outputs/apk/debug/*.apk
-            source/app/build/outputs/apk/debug/*.apk
-            ${{ runner.temp }}/hamrah-device-test/
-          if-no-files-found: warn
-          retention-days: 14
+package com.hamrahsarmaye.app
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.os.Bundle
+import android.graphics.Color
+import android.view.Gravity
+import android.view.View
+import android.widget.*
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.NumberFormat
+import java.util.Locale
+import android.text.InputType
+import android.text.method.PasswordTransformationMethod
+import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
+import android.os.SystemClock
+
+data class AssetItem(
+    val name: String,
+    var amount: Double = 0.0,
+    var averageBuyPrice: Double = 0.0,
+    var positionCountry: String = "ایران",
+    // currentPrice remains the local-market quote for backward compatibility.
+    var currentPrice: Double = 0.0,
+    var realizedPnl: Double = 0.0,
+    var globalPrice: Double = 0.0,
+    var globalCurrency: String = "USD",
+    var globalUnit: String = "per troy ounce",
+    var internalSource: String = "ثبت دستی",
+    var internalCountry: String = "ایران",
+    var globalSource: String = "تنظیم نشده",
+    var internalUpdatedAt: String = "",
+    var globalUpdatedAt: String = "",
+    // Domestic-currency units per 1 USD, used for theoretical gold conversion.
+    var usdToLocalRate: Double = 0.0,
+    var usdToLocalCountry: String = "",
+    var assetType: String = "سایر",
+    var valuationBase: Double = 0.0,
+    var valuationArea: Double = 0.0,
+    var valuationAdjustmentPercent: Double = 0.0,
+    var valuationDetails: String = ""
+)
+
+
+data class TradeRecord(
+    val assetName: String,
+    val side: String,
+    val quantity: Double,
+    val unitPrice: Double,
+    val currency: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+data class WatchItem(val name: String, val assetType: String, val country: String)
+
+class MainActivity : Activity() {
+    private val assets = mutableListOf<AssetItem>()
+    private val watchlist = mutableListOf<WatchItem>()
+    private val tradeHistory = mutableListOf<TradeRecord>()
+    private lateinit var content: LinearLayout
+    private val prefs by lazy { getSharedPreferences("hamrah_sarmaye_data", MODE_PRIVATE) }
+    private val nf = NumberFormat.getNumberInstance(Locale("fa", "IR"))
+    private val supportedCountries = arrayOf("ایران", "آلمان", "فرانسه", "ترکیه", "امارات", "عراق", "افغانستان", "کشور دیگر")
+    private var selectedCountry = "ایران"
+    private var authenticated = false
+    private var needsReauthentication = false
+    private var authDialogShowing = false
+    private var authDialog: AlertDialog? = null
+    private var globalFeedScheduler: MarketRefreshScheduler? = null
+    private var globalFeedSignature: String = ""
+    private data class AppTheme(val key: String, val title: String, val background: Int, val surface: Int, val text: Int, val accent: Int)
+    private val appThemes = listOf(
+        AppTheme("gold", "مشکی و طلایی کلاسیک", Color.rgb(20, 20, 22), Color.rgb(38, 36, 32), Color.WHITE, Color.rgb(218, 174, 75)),
+        AppTheme("light", "روشن و نقره‌ای", Color.rgb(247, 248, 250), Color.WHITE, Color.rgb(35, 39, 45), Color.rgb(105, 115, 128)),
+        AppTheme("navy", "سرمه‌ای و طلایی", Color.rgb(15, 39, 59), Color.rgb(27, 57, 80), Color.WHITE, Color.rgb(225, 190, 105)),
+        AppTheme("green", "سبز تیره و کرم", Color.rgb(22, 55, 46), Color.rgb(35, 72, 61), Color.WHITE, Color.rgb(226, 211, 170)),
+        AppTheme("amoled", "مشکی AMOLED", Color.BLACK, Color.rgb(16, 16, 16), Color.WHITE, Color.rgb(235, 190, 75))
+    )
+    private fun isLightTheme(theme: AppTheme = activeTheme) = theme.key == "light"
+    private val activeTheme: AppTheme get() = appThemes.firstOrNull { it.key == prefs.getString("app_theme", "gold") } ?: appThemes[0]
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        selectedCountry = prefs.getString("selected_country", "ایران") ?: "ایران"
+        loadAssets()
+        showSecurityGate()
+    }
+
+    override fun onStop() {
+        if (authenticated) {
+            authenticated = false
+            needsReauthentication = true
+        }
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (needsReauthentication && !authenticated) {
+            needsReauthentication = false
+            showSecurityGate()
+        }
+    }
+
+    private fun showSecurityGate() {
+        if (authDialogShowing || isFinishing) return
+        authDialogShowing = true
+        val storedHash = prefs.getString("security_pin_hash", null)
+        if (storedHash.isNullOrBlank()) showPinSetup() else showPinEntry()
+    }
+
+    private fun pinField(hintText: String) = EditText(this).apply {
+        hint = hintText
+        inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        transformationMethod = PasswordTransformationMethod.getInstance()
+        filters = arrayOf(android.text.InputFilter.LengthFilter(12))
+    }
+
+    private fun showPinSetup() {
+        val first = pinField("رمز جدید؛ حداقل ۶ رقم")
+        val confirm = pinField("تکرار رمز")
+        val layout = dialogBox(first, confirm)
+        AlertDialog.Builder(this)
+            .setTitle("تعریف رمز ورود")
+            .setMessage("برای محافظت از اطلاعات مالی، یک رمز ۶ تا ۱۲ رقمی تعریف کنید. این رمز در هر بار ورود لازم است.")
+            .setView(layout)
+            .setCancelable(false)
+            .setPositiveButton("ثبت رمز", null)
+            .show().also { dialog ->
+                authDialog = dialog
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val a = first.text.toString()
+                    val b = confirm.text.toString()
+                    if (a.length !in 6..12 || a.any { !it.isDigit() }) {
+                        first.error = "رمز باید ۶ تا ۱۲ رقم باشد"
+                    } else if (a != b) {
+                        confirm.error = "دو رمز یکسان نیستند"
+                    } else {
+                        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+                        val hash = derivePinHash(a, salt)
+                        prefs.edit().putString("security_pin_salt", android.util.Base64.encodeToString(salt, android.util.Base64.NO_WRAP))
+                            .putString("security_pin_hash", android.util.Base64.encodeToString(hash, android.util.Base64.NO_WRAP))
+                            .putInt("security_failed_attempts", 0).apply()
+                        authenticated = true
+                        authDialogShowing = false
+                        dialog.dismiss()
+                        render()
+                        toast("رمز ورود با موفقیت تعریف شد.")
+                    }
+                }
+                dialog.setOnDismissListener {
+                    if (authDialog === dialog) authDialog = null
+                    if (!authenticated) authDialogShowing = false
+                }
+            }
+    }
+
+    private fun showPinEntry() {
+        val pin = pinField("رمز ورود")
+        val message = "برای ورود به همراه سرمایه رمز خود را وارد کنید. پس از ۵ بار تلاش ناموفق، ورود برای ۳۰ ثانیه محدود می‌شود."
+        AlertDialog.Builder(this)
+            .setTitle("قفل امنیتی همراه سرمایه")
+            .setMessage(message)
+            .setView(pin)
+            .setCancelable(false)
+            .setPositiveButton("ورود", null)
+            .show().also { dialog ->
+                authDialog = dialog
+                val enter = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                enter.setOnClickListener {
+                    val lockUntil = prefs.getLong("security_lock_until_elapsed", 0L)
+                    if (lockUntil > SystemClock.elapsedRealtime()) {
+                        val seconds = ((lockUntil - SystemClock.elapsedRealtime()) / 1000L + 1L).coerceAtLeast(1L)
+                        pin.error = "لطفاً $seconds ثانیه دیگر تلاش کنید"
+                        return@setOnClickListener
+                    }
+                    val salt = android.util.Base64.decode(prefs.getString("security_pin_salt", "") ?: "", android.util.Base64.DEFAULT)
+                    val expected = android.util.Base64.decode(prefs.getString("security_pin_hash", "") ?: "", android.util.Base64.DEFAULT)
+                    val candidate = derivePinHash(pin.text.toString(), salt)
+                    if (pin.text.length in 6..12 && MessageDigest.isEqual(expected, candidate)) {
+                        prefs.edit().putInt("security_failed_attempts", 0).putLong("security_lock_until_elapsed", 0L).apply()
+                        authenticated = true
+                        authDialogShowing = false
+                        dialog.dismiss()
+                        render()
+                    } else {
+                        val attempts = prefs.getInt("security_failed_attempts", 0) + 1
+                        val editor = prefs.edit().putInt("security_failed_attempts", attempts)
+                        if (attempts >= 5) {
+                            editor.putLong("security_lock_until_elapsed", SystemClock.elapsedRealtime() + 30_000L)
+                            editor.putInt("security_failed_attempts", 0)
+                        }
+                        editor.apply()
+                        pin.text.clear()
+                        pin.error = if (attempts >= 5) "۵ بار تلاش ناموفق؛ ورود برای ۳۰ ثانیه محدود شد" else "رمز اشتباه است (${attempts}/5)"
+                    }
+                }
+                dialog.setOnDismissListener {
+                    if (authDialog === dialog) authDialog = null
+                    if (!authenticated) authDialogShowing = false
+                }
+            }
+    }
+
+    private fun derivePinHash(pin: String, salt: ByteArray): ByteArray {
+        val spec = PBEKeySpec(pin.toCharArray(), salt, 120_000, 256)
+        return try { SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded }
+        finally { spec.clearPassword() }
+    }
+
+    private fun parseNumber(value: String): Double? {
+        val normalized = value
+            .replace('۰', '0').replace('۱', '1').replace('۲', '2').replace('۳', '3')
+            .replace('۴', '4').replace('۵', '5').replace('۶', '6').replace('۷', '7')
+            .replace('۸', '8').replace('۹', '9')
+            .replace('٠', '0').replace('١', '1').replace('٢', '2').replace('٣', '3')
+            .replace('٤', '4').replace('٥', '5').replace('٦', '6').replace('٧', '7')
+            .replace('٨', '8').replace('٩', '9').replace(",", "").replace("٬", "").trim()
+        return normalized.toDoubleOrNull()
+    }
+
+    private fun currencyLabel(country: String): String = when (country) {
+        "ایران" -> "تومان"
+        "آلمان", "فرانسه" -> "یورو"
+        "ترکیه" -> "لیر"
+        "امارات" -> "درهم"
+        "عراق" -> "دینار عراق"
+        "افغانستان" -> "افغانی"
+        else -> "ارز محلی"
+    }
+    private fun localCurrencyLabel(): String = currencyLabel(selectedCountry)
+    private fun money(value: Double): String = "${nf.format(value.toLong())} ${localCurrencyLabel()}"
+    private fun positionMoney(item: AssetItem, value: Double): String = "${nf.format(value.toLong())} ${currencyLabel(item.positionCountry)}"
+    // Legacy/manual values are never accepted as current market quotes. This stays zero until a verified provider feed is integrated.
+    private fun localPrice(item: AssetItem): Double = 0.0
+    private fun fmt(value: Double): String = nf.format(value)
+
+    /** Resolves each asset once in the background; the ordinary user never enters URLs or symbols. */
+    private fun ensureGlobalReference(assetType: String, assetName: String) {
+        val candidate = GlobalAssetResolver.identify(assetType, assetName) ?: return
+        val prefKey = "global_ref_${candidate.key}"
+        val stored = GlobalAssetResolver.load(prefs, assetType, assetName)
+        val registryConfigured = BuildConfig.GLOBAL_ASSET_REGISTRY_URL.isNotBlank()
+        if (stored?.feedReady == true) return
+        if (stored != null && !registryConfigured) return
+        val lastAttempt = prefs.getLong("${prefKey}_attempted_at", 0L)
+        if (prefs.getBoolean("${prefKey}_resolving", false) ||
+            (lastAttempt > 0L && System.currentTimeMillis() - lastAttempt < 6 * 60 * 60_000L)) return
+        prefs.edit().putBoolean("${prefKey}_resolving", true)
+            .putLong("${prefKey}_attempted_at", System.currentTimeMillis()).apply()
+        Thread {
+            val resolved = GlobalAssetResolver.resolve(assetType, assetName)
+            runOnUiThread {
+                if (resolved != null) GlobalAssetResolver.save(prefs, resolved)
+                prefs.edit().remove("${prefKey}_resolving").apply()
+                if (!isFinishing) render()
+            }
+        }.start()
+    }
+
+    private fun saveAssets() {
+        val array = JSONArray()
+        assets.forEach { item ->
+            array.put(JSONObject().apply {
+                put("name", item.name)
+                put("amount", item.amount)
+                put("averageBuyPrice", item.averageBuyPrice)
+                put("positionCountry", item.positionCountry)
+                put("currentPrice", item.currentPrice)
+                put("realizedPnl", item.realizedPnl)
+                put("globalPrice", item.globalPrice)
+                put("globalCurrency", item.globalCurrency)
+                put("globalUnit", item.globalUnit)
+                put("internalSource", item.internalSource)
+                put("internalCountry", item.internalCountry)
+                put("globalSource", item.globalSource)
+                put("internalUpdatedAt", item.internalUpdatedAt)
+                put("globalUpdatedAt", item.globalUpdatedAt)
+                put("usdToLocalRate", item.usdToLocalRate)
+                put("usdToLocalCountry", item.usdToLocalCountry)
+                put("assetType", item.assetType)
+                put("valuationBase", item.valuationBase)
+                put("valuationArea", item.valuationArea)
+                put("valuationAdjustmentPercent", item.valuationAdjustmentPercent)
+                put("valuationDetails", item.valuationDetails)
+            })
+        }
+        val watchJson = JSONArray()
+        watchlist.forEach { w -> watchJson.put(JSONObject().put("name", w.name).put("assetType", w.assetType).put("country", w.country)) }
+        val tradesJson = JSONArray()
+        tradeHistory.forEach { t -> tradesJson.put(JSONObject().put("assetName", t.assetName).put("side", t.side).put("quantity", t.quantity).put("unitPrice", t.unitPrice).put("currency", t.currency).put("timestamp", t.timestamp)) }
+        prefs.edit().putString("assets", array.toString()).putString("watchlist", watchJson.toString()).putString("trade_history", tradesJson.toString()).apply()
+    }
+
+    private fun loadAssets() {
+        assets.clear()
+        val raw = prefs.getString("assets", null)
+            ?: prefs.getString("pre_update_backup_assets", null)
+            ?: "[]"
+        if (prefs.getString("assets", null) == null) {
+            prefs.edit()
+                .putString("assets", raw)
+                .putString("selected_country", prefs.getString("pre_update_backup_country", "ایران"))
+                .apply()
+            selectedCountry = prefs.getString("selected_country", "ایران") ?: "ایران"
+        }
+        try {
+            val array = JSONArray(raw)
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                assets.add(AssetItem(
+                    name = obj.optString("name", "دارایی"),
+                    amount = obj.optDouble("amount", 0.0),
+                    averageBuyPrice = obj.optDouble("averageBuyPrice", 0.0),
+                    positionCountry = obj.optString("positionCountry", "ایران"),
+                    currentPrice = obj.optDouble("currentPrice", 0.0),
+                    realizedPnl = obj.optDouble("realizedPnl", 0.0),
+                    globalPrice = obj.optDouble("globalPrice", 0.0),
+                    globalCurrency = obj.optString("globalCurrency", "USD"),
+                    globalUnit = obj.optString("globalUnit", "per troy ounce"),
+                    internalSource = obj.optString("internalSource", "ثبت دستی"),
+                    internalCountry = obj.optString("internalCountry", "ایران"),
+                    globalSource = obj.optString("globalSource", "تنظیم نشده"),
+                    internalUpdatedAt = obj.optString("internalUpdatedAt", ""),
+                    globalUpdatedAt = obj.optString("globalUpdatedAt", ""),
+                    usdToLocalRate = obj.optDouble("usdToLocalRate", 0.0),
+                    usdToLocalCountry = obj.optString("usdToLocalCountry", ""),
+                    assetType = obj.optString("assetType", "سایر"),
+                    valuationBase = obj.optDouble("valuationBase", 0.0),
+                    valuationArea = obj.optDouble("valuationArea", 0.0),
+                    valuationAdjustmentPercent = obj.optDouble("valuationAdjustmentPercent", 0.0),
+                    valuationDetails = obj.optString("valuationDetails", "")
+                ))
+            }
+            watchlist.clear()
+            val watchRaw = prefs.getString("watchlist", "[]") ?: "[]"
+            val watchArray = JSONArray(watchRaw)
+            for (i in 0 until watchArray.length()) {
+                val o = watchArray.getJSONObject(i)
+                watchlist.add(WatchItem(o.optString("name"), o.optString("assetType", "سایر"), o.optString("country", selectedCountry)))
+            }
+            tradeHistory.clear()
+            val tradeRaw = prefs.getString("trade_history", "[]") ?: "[]"
+            val tradeArray = JSONArray(tradeRaw)
+            for (i in 0 until tradeArray.length()) {
+                val o = tradeArray.getJSONObject(i)
+                tradeHistory.add(TradeRecord(o.optString("assetName"), o.optString("side"), o.optDouble("quantity"), o.optDouble("unitPrice"), o.optString("currency"), o.optLong("timestamp")))
+            }
+        } catch (_: Exception) {
+            Toast.makeText(this, "اطلاعات ذخیره‌شده قابل خواندن نبود.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun render() {
+        val scroll = ScrollView(this)
+        content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(28))
+            setBackgroundColor(activeTheme.background)
+        }
+        scroll.addView(content)
+
+        val brandHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(0, 4, 0, 16)
+        }
+        val logo = ImageView(this).apply {
+            setImageResource(R.drawable.app_logo)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = "لوگوی همراه سرمایه"
+        }
+        brandHeader.addView(logo, LinearLayout.LayoutParams(dp(142), dp(142)))
+        val brandTitle = TextView(this).apply {
+            text = "همراه سرمایه"
+            textSize = 27f
+            setTextColor(activeTheme.accent)
+            gravity = Gravity.CENTER
+            setTypeface(null, android.graphics.Typeface.BOLD)
+        }
+        brandHeader.addView(brandTitle)
+        val slogan = TextView(this).apply {
+            text = "سرمایه مردم، امانت ماست؛ اول محافظت، بعد رشد."
+            textSize = 13f
+            setTextColor(activeTheme.text)
+            gravity = Gravity.CENTER
+        }
+        brandHeader.addView(slogan)
+        content.addView(brandHeader)
+        addText(content, "کشور بازار داخلی: $selectedCountry", 14, activeTheme.text, true)
+
+        // Dashboard summary cards: only user-entered values are shown; no fabricated live quotes.
+        addText(content, "نمای کلی دارایی‌ها", 18, activeTheme.accent, true)
+        val overview = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val previewAssets = assets.take(3)
+        if (previewAssets.isEmpty()) {
+            listOf("طلای ۱۸ عیار", "دلار آزاد", "سکه").forEach { title ->
+                overview.addView(marketPreviewCard(title, "برای نمایش، دارایی ثبت کنید"),
+                    LinearLayout.LayoutParams(0, dp(92), 1f))
+            }
+        } else {
+            previewAssets.forEach { item ->
+                val value = if (item.amount > 0 && item.averageBuyPrice > 0) money(item.amount * item.averageBuyPrice) else "موجودی ثبت نشده"
+                overview.addView(marketPreviewCard(item.name, value),
+                    LinearLayout.LayoutParams(0, dp(92), 1f))
+            }
+        }
+        content.addView(overview)
+
+        card {
+            addText(this, "تحلیل هوشمند بازار", 17, activeTheme.accent, true)
+            addText(this, "اتصال قیمت زنده و موتور سیگنال هنوز تأیید نشده است؛ بنابراین این بخش فعلاً وضعیت داده را نشان می‌دهد و توصیه خرید یا فروش صادر نمی‌کند.", 13, activeTheme.text)
+            addText(this, "رنگ سیگنال‌ها در نسخه عملیاتی ثابت خواهد بود: سبز فرصت، قرمز ریسک، زرد نامشخص.", 11, activeTheme.text)
+        }
+
+        val total = assets.sumOf { item ->
+            if (item.assetType == "خانه / ملک" || item.assetType == "خودرو") {
+                if (item.positionCountry == selectedCountry) estimatedValue(item) else 0.0
+            } else item.amount * localPrice(item)
+        }
+        val unrealized = assets.sumOf { item ->
+            if (item.assetType != "خانه / ملک" && item.assetType != "خودرو" && localPrice(item) > 0)
+                item.amount * (localPrice(item) - item.averageBuyPrice) else 0.0
+        }
+        val realizedByCountry = assets.groupBy { it.positionCountry }.mapValues { (_, items) -> items.sumOf { it.realizedPnl } }
+        card {
+            addText(this, "ارزش تقریبی دارایی‌های بازار $selectedCountry", 15, Color.DKGRAY)
+            addText(this, money(total), 24, Color.rgb(25, 70, 55), true)
+            addText(this, "سود/زیان تحقق‌نیافته: ${money(unrealized)}", 14, pnlColor(unrealized))
+            realizedByCountry.forEach { (country, value) ->
+                addText(this, "سود/زیان تحقق‌یافته در بازار $country: ${nf.format(value.toLong())} ${currencyLabel(country)}", 14, pnlColor(value))
+            }
+            addText(this, "ارزش سبد فقط با قیمت معتبرِ بازار کشور انتخاب‌شده محاسبه می‌شود.", 12, Color.GRAY)
+            addText(this, "قیمت بازار تا اتصال منبع معتبر نمایش داده نمی‌شود؛ مقادیر قدیمی/دستی برای ارزش‌گذاری استفاده نمی‌شوند.", 12, Color.GRAY)
+        }
+
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        actions.addView(button("افزودن دارایی") { addAssetDialog() }, LinearLayout.LayoutParams(0, -2, 1f))
+        actions.addView(button("ذخیره اطلاعات") { saveAssets(); toast("اطلاعات ذخیره شد.") }, LinearLayout.LayoutParams(0, -2, 1f))
+        content.addView(actions)
+        content.addView(button("انتخاب کشور بازار داخلی") { countryDialog() })
+        content.addView(button("به‌روزرسانی همراه سرمایه") { checkForAppUpdate() })
+        content.addView(button("تنظیمات ظاهر و انتخاب رنگ‌بندی") { themeDialog() })
+        addText(content, "دارایی‌های تحت نظر (بدون نیاز به مالکیت)", 19, activeTheme.accent, true)
+        addText(content, "این فهرست فقط برای پایش بازار است و به دارایی‌های شخصی اضافه نمی‌شود.", 12, Color.GRAY)
+        content.addView(button("افزودن به فهرست تحت نظر") { addWatchItemDialog() })
+        if (watchlist.isEmpty()) card { addText(this, "هنوز موردی برای پایش انتخاب نشده است.", 13, Color.GRAY) }
+        watchlist.forEachIndexed { wi, w ->
+            ensureGlobalReference(w.assetType, w.name)
+            card {
+                addText(this, w.name, 16, Color.BLACK, true)
+                addText(this, "${w.assetType} · بازار ${w.country}", 12, Color.GRAY)
+                addText(this, "وضعیت قیمت: هنوز به منبع معتبر متصل نشده؛ سیگنال صادر نمی‌شود.", 12, Color.rgb(150, 110, 20))
+                addView(button("حذف از فهرست تحت نظر") { watchlist.removeAt(wi); saveAssets(); render() })
+            }
+        }
+        addText(content, "نسخه برنامه: ${BuildConfig.VERSION_NAME}", 12, Color.GRAY)
+        addText(content, "دارایی‌های من (${assets.size} از ۱۰)", 20, activeTheme.accent, true)
+
+        if (assets.isEmpty()) {
+            card { addText(this, "هنوز دارایی‌ای ثبت نکرده‌اید. برای شروع، گزینه «افزودن دارایی» را بزنید.", 14, Color.DKGRAY) }
+        }
+
+        assets.forEachIndexed { index, item ->
+            ensureGlobalReference(item.assetType, item.name)
+            card {
+                addText(this, item.name, 18, Color.BLACK, true)
+                addText(this, "نوع دارایی: ${item.assetType}", 13, Color.DKGRAY)
+                if (item.assetType == "خانه / ملک" || item.assetType == "خودرو") {
+                    val estimate = estimatedValue(item)
+                    if (estimate > 0.0) {
+                        addText(this, "ارزش تخمینی: ${positionMoney(item, estimate)}", 16, Color.rgb(25, 70, 55), true)
+                        addText(this, "این عدد برآورد بر اساس اطلاعات ثبت‌شده است؛ قیمت قطعی یا قیمت‌گذاری زنده نیست.", 12, Color.GRAY)
+                    } else {
+                        addText(this, "برای برآورد ارزش، مشخصات و قیمت نمونه مشابه را ثبت کنید.", 12, Color.GRAY)
+                    }
+                    if (item.valuationDetails.isNotBlank()) addText(this, "مشخصات: ${item.valuationDetails}", 12, Color.GRAY)
+                    addView(button("ثبت مشخصات و مبنای ارزش‌گذاری") { valuationDialog(index) })
+                } else {
+                    addText(this, "موجودی: ${fmt(item.amount)}", 14, Color.DKGRAY)
+                }
+                if (item.assetType != "خانه / ملک" && item.assetType != "خودرو") {
+                    addText(this, "میانگین قیمت خرید: ${positionMoney(item, item.averageBuyPrice)} · بازار ${item.positionCountry}", 14, Color.DKGRAY)
+                    addText(this, if (localPrice(item) > 0) "قیمت بازار داخلی: ${money(localPrice(item))}" else if (item.currentPrice > 0) "قیمت ثبت‌شده مربوط به بازار ${item.internalCountry} است؛ برای کشور انتخابی معتبر نیست." else "قیمت بازار داخلی ثبت نشده است.", 14, Color.DKGRAY)
+                    addText(this, "منبع داخلی (داده ذخیره‌شده قدیمی/دستی؛ غیرزنده): ${item.internalSource} · کشور منبع: ${item.internalCountry}${if (item.internalUpdatedAt.isNotBlank()) " · ${item.internalUpdatedAt}" else ""}", 12, Color.GRAY)
+                    addText(this, if (item.globalPrice > 0) "قیمت مرجع جهانی: ${nf.format(item.globalPrice)} ${item.globalCurrency} ${item.globalUnit}" else "قیمت مرجع جهانی: هنوز پیکربندی نشده", 14, Color.DKGRAY)
+                    addText(this, "منبع جهانی (نیازمند اتصال معتبر): ${item.globalSource}${if (item.globalUpdatedAt.isNotBlank()) " · ${item.globalUpdatedAt}" else ""}", 12, Color.GRAY)
+                    val globalRef = GlobalAssetResolver.load(prefs, item.assetType, item.name)
+                    if (globalRef != null) {
+                        addText(this, "شناسه مرجع جهانی: ${globalRef.benchmarkId} · ${globalRef.displayName}", 12, Color.DKGRAY)
+                        addText(this, "وضعیت شناسایی خودکار: ${globalRef.status}", 12, if (globalRef.feedReady) Color.rgb(25, 130, 80) else Color.rgb(150, 110, 20))
+                        if (globalRef.feedReady) addText(this, "تأمین‌کننده: ${globalRef.providerName} · واحد مرجع: ${globalRef.unit}", 12, Color.GRAY)
+                    } else {
+                        addText(this, "مرجع جهانی تخصصی برای این دارایی هنوز در کاتالوگ شناسایی نشده است؛ هیچ نماد حدسی استفاده نمی‌شود.", 12, Color.GRAY)
+                    }
+                    val validLocalPrice = localPrice(item)
+                    if (validLocalPrice > 0) {
+                        val unrealizedPnl = item.amount * (validLocalPrice - item.averageBuyPrice)
+                        addText(this, "سود/زیان تحقق‌نیافته: ${money(unrealizedPnl)}", 14, pnlColor(unrealizedPnl))
+                    } else {
+                        addText(this, "سود/زیان تحقق‌نیافته: تا دریافت قیمت معتبر محاسبه نمی‌شود.", 14, Color.GRAY)
+                    }
+                    addText(this, "سود/زیان تحقق‌یافته: ${positionMoney(item, item.realizedPnl)}", 14, pnlColor(item.realizedPnl))
+                    val itemTrades = tradeHistory.filter { it.assetName == item.name }
+                    addText(this, "سوابق ثبت‌شده خرید/فروش: ${itemTrades.size} معامله", 12, Color.GRAY)
+                    itemTrades.takeLast(3).asReversed().forEach { tr ->
+                        val sideLabel = if (tr.side == "BUY") "خرید" else "فروش"
+                        addText(this, "$sideLabel · مقدار ${fmt(tr.quantity)} · قیمت واحد ${nf.format(tr.unitPrice)} ${tr.currency}", 12, Color.DKGRAY)
+                    }
+                    val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+                    row.addView(button("خرید") { tradeDialog(index, true) }, LinearLayout.LayoutParams(0, -2, 1f))
+                    row.addView(button("فروش") { tradeDialog(index, false) }, LinearLayout.LayoutParams(0, -2, 1f))
+                    addView(row)
+                    if (isGoldAsset(item)) {
+                        val theoreticalGold18 = theoreticalGold18Price(item)
+                        if (theoreticalGold18 != null) {
+                            addText(this, "قیمت نظری مبنا برای هر گرم طلای ۱۸ عیار: ${positionMoney(item, theoreticalGold18)}", 14, Color.rgb(25, 70, 55), true)
+                            addText(this, "فرمول: قیمت اونس دلاری × نرخ دلار بازار ${item.usdToLocalCountry} ÷ ۴۱٫۴۷۱۳", 12, Color.GRAY)
+                            val domestic = localPrice(item)
+                            if (isGold18GramAsset(item) && domestic > 0.0 && theoreticalGold18 > 0.0) {
+                                val bubble = ((domestic - theoreticalGold18) / theoreticalGold18) * 100.0
+                                val bubbleColor = when { bubble > 0.5 -> Color.rgb(190, 70, 45); bubble < -0.5 -> Color.rgb(25, 130, 80); else -> Color.DKGRAY }
+                                val bubbleText = (if (bubble > 0) "+" else "") + String.format(Locale.US, "%.2f", bubble) + "٪"
+                                addText(this, "حباب خام بازار داخلی نسبت به ارزش نظری: $bubbleText", 15, bubbleColor, true)
+                                addText(this, if (bubble < -0.5) "قیمت داخلی پایین‌تر از مبنای نظری است؛ این اختلاف به‌تنهایی توصیه خرید نیست." else if (bubble > 0.5) "قیمت داخلی بالاتر از مبنای نظری است؛ این اختلاف به‌تنهایی توصیه فروش نیست." else "قیمت داخلی نزدیک مبنای نظری محاسبه‌شده است.", 12, Color.GRAY)
+                                addText(this, "حباب خام است و هزینه‌ها، اختلاف خریدوفروش و نقدشوندگی در آن تعدیل نشده‌اند.", 12, Color.GRAY)
+                            } else if (!isGold18GramAsset(item)) {
+                                addText(this, "برای محاسبه حباب، نام دارایی باید مشخص کند قیمت ثبت‌شده مربوط به هر گرم طلای ۱۸ عیار است.", 12, Color.GRAY)
+                            } else {
+                                addText(this, "برای محاسبه حباب، قیمت داخلی هر گرم طلای ۱۸ عیار را ثبت کنید.", 12, Color.GRAY)
+                            }
+                        } else {
+                            addText(this, "برای محاسبه قیمت نظری، مرجع جهانی باید قیمت هر اونس تروا به USD باشد و نرخ دلار بازار کشور انتخابی ثبت شود.", 12, Color.GRAY)
+                        }
+                        addView(button("ثبت نرخ دلار بازار داخلی برای محاسبه طلا") { goldFxDialog(index) })
+                    }
+                } else {
+                    addText(this, "مبنای مقایسه: قیمت نمونه مشابه واردشده توسط کاربر", 12, Color.GRAY)
+                    addText(this, "بازار ارزش‌گذاری: ${item.positionCountry}", 12, Color.GRAY)
+                }
+            }
+        }
+        addText(content, "توجه: فقط مظنه‌ای که از endpoint تأییدشده و دارای timestamp معتبر دریافت شود، می‌تواند قیمت مرجع زنده تلقی شود؛ این نسخه هنوز سیگنال مالی صادر نمی‌کند.", 12, activeTheme.text)
+
+        val bottomNav = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(4), dp(5), dp(4), dp(5))
+            setBackgroundColor(if (isLightTheme()) Color.rgb(235, 237, 240) else Color.rgb(8, 8, 9))
+        }
+        val navItems = listOf("⌂\\nخانه", "▥\\nتحلیل", "▣\\nدارایی‌ها", "⇄\\nتبدیل ارز", "⚙\\nتنظیمات")
+        navItems.forEachIndexed { index, label ->
+            val nav = TextView(this).apply {
+                text = label
+                gravity = Gravity.CENTER
+                textSize = 10f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(activeTheme.accent)
+                setPadding(dp(2), dp(5), dp(2), dp(5))
+                setOnClickListener {
+                    when (index) {
+                        0 -> scroll.smoothScrollTo(0, 0)
+                        1 -> scroll.smoothScrollTo(0, dp(260))
+                        2 -> scroll.smoothScrollTo(0, dp(500))
+                        3 -> toast("تبدیل ارز پس از اتصال نرخ معتبر داخلی فعال می‌شود.")
+                        4 -> themeDialog()
+                    }
+                }
+            }
+            bottomNav.addView(nav, LinearLayout.LayoutParams(0, dp(50), 1f))
+        }
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(activeTheme.background)
+            addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(bottomNav, LinearLayout.LayoutParams(-1, dp(58)))
+        }
+        setContentView(page)
+        startGlobalFeedScheduler()
+    }
+
+    private fun marketPreviewCard(title: String, value: String): View {
+        val cardView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(5), dp(8), dp(5), dp(8))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(activeTheme.surface)
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(1), activeTheme.accent)
+            }
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 11f
+                gravity = Gravity.CENTER
+                setTextColor(activeTheme.text)
+                maxLines = 2
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = value
+                textSize = 10f
+                gravity = Gravity.CENTER
+                setTextColor(activeTheme.accent)
+                maxLines = 2
+            })
+        }
+        cardView.layoutParams = LinearLayout.LayoutParams(0, dp(92), 1f).apply {
+            setMargins(dp(3), dp(2), dp(3), dp(2))
+        }
+        return cardView
+    }
+
+    /** Starts/rebuilds the independent global feeds when maker registry mappings become available. */
+    private fun startGlobalFeedScheduler() {
+        val configs = assets.mapNotNull { item ->
+            GlobalAssetResolver.load(prefs, item.assetType, item.name)?.let(GlobalAssetResolver::toFeedConfig)
+        }.distinctBy { it.assetKey }
+        val signature = configs.map { "${it.assetKey}:${it.endpoint}" }.sorted().joinToString("|")
+        if (signature == globalFeedSignature) return
+        globalFeedScheduler?.stop()
+        globalFeedScheduler = null
+        globalFeedSignature = signature
+        if (configs.isEmpty()) return
+        globalFeedScheduler = MarketRefreshScheduler(intervalMs = 5 * 60_000L) { _, result ->
+            if (result is FeedResult.Success && MarketDataPolicy.assess(result.quote).usableForAnalysis) {
+                val q = result.quote
+                runOnUiThread {
+                    assets.filter { item ->
+                        GlobalAssetResolver.identify(item.assetType, item.name)?.key == q.assetKey
+                    }.forEach { item ->
+                        item.globalPrice = q.value
+                        item.globalCurrency = q.currency
+                        item.globalUnit = q.unit
+                        item.globalSource = q.provider
+                        item.globalUpdatedAt = q.observedAtEpochMs.toString()
+                    }
+                    saveAssets()
+                    if (!isFinishing) render()
+                }
+            }
+        }.also { it.start(configs) }
+    }
+
+    override fun onDestroy() {
+        globalFeedScheduler?.stop()
+        globalFeedScheduler = null
+
+        // Release the security dialog before this Activity's window is destroyed.
+        // This prevents a Dialog window from being retained by a dead Activity.
+        authDialog?.let { dialog ->
+            dialog.setOnDismissListener(null)
+            if (dialog.isShowing) dialog.dismiss()
+        }
+        authDialog = null
+        authDialogShowing = false
+
+        super.onDestroy()
+    }
+
+    // Exact conversion factor for 1 troy ounce of 24k gold to grams of 18k gold.
+    // 31.1034768 g / 0.75 = 41.4713024; retained at the agreed 4-decimal precision.
+    private companion object { const val GOLD_18_FACTOR = 41.4713 }
+
+    private fun isGoldAsset(item: AssetItem): Boolean {
+        val name = item.name.lowercase(Locale.ROOT)
+        return item.assetType == "طلا و فلزات" && (name.contains("طلا") || name.contains("gold"))
+    }
+
+    private fun theoreticalGold18Price(item: AssetItem): Double? {
+        val unit = item.globalUnit.lowercase(Locale.ROOT)
+        val isTroyOunce = unit.contains("اونس") || unit.contains("ounce")
+        if (item.globalPrice <= 0.0 || item.globalCurrency.uppercase(Locale.ROOT) != "USD" ||
+            !isTroyOunce || item.usdToLocalRate <= 0.0 || item.usdToLocalCountry != selectedCountry ||
+            item.positionCountry != selectedCountry) return null
+        val calculated = (item.globalPrice * item.usdToLocalRate) / GOLD_18_FACTOR
+        return calculated.takeIf { it.isFinite() && it > 0.0 }
+    }
+
+    // Bubble comparison is only valid when the domestic quote is explicitly per gram of 18k gold.
+    private fun isGold18GramAsset(item: AssetItem): Boolean {
+        val name = item.name.lowercase(Locale.ROOT)
+        val has18K = name.contains("۱۸") || name.contains("18")
+        val hasGram = name.contains("گرم") || name.contains("gram") || name.endsWith(" g")
+        return isGoldAsset(item) && has18K && hasGram
+    }
+
+    private fun checkForAppUpdate() {
+        Toast.makeText(this, "در حال بررسی نسخه جدید...", Toast.LENGTH_SHORT).show()
+        UpdateSupport.check(this) { manifest, error ->
+            if (isFinishing) return@check
+            if (error != null || manifest == null) {
+                AlertDialog.Builder(this).setTitle("بررسی به‌روزرسانی")
+                    .setMessage(error ?: "اطلاعات نسخه دریافت نشد.")
+                    .setPositiveButton("باشه", null).show()
+                return@check
+            }
+            val remoteCode = manifest.optInt("versionCode", -1)
+            val remoteName = manifest.optString("versionName", "")
+            if (remoteCode <= BuildConfig.VERSION_CODE) {
+                AlertDialog.Builder(this).setTitle("به‌روزرسانی")
+                    .setMessage("برنامه شما به‌روز است. نسخه فعلی: ${BuildConfig.VERSION_NAME}")
+                    .setPositiveButton("باشه", null).show()
+                return@check
+            }
+            val notes = manifest.optString("releaseNotes", "توضیحات تغییرات ثبت نشده است.")
+            AlertDialog.Builder(this).setTitle("نسخه جدید $remoteName")
+                .setMessage("نسخه فعلی: ${BuildConfig.VERSION_NAME}\nنسخه جدید: $remoteName\n\nتغییرات:\n$notes\n\nپیش از دریافت، از اطلاعات دارایی‌ها نسخه پشتیبان داخلی تهیه می‌شود. نصب نسخه جدید فقط با امضای معتبر همان سازنده امکان‌پذیر است.")
+                .setPositiveButton("دریافت نسخه جدید") { _, _ ->
+                    saveAssets()
+                    prefs.edit()
+                        .putString("pre_update_backup_assets", prefs.getString("assets", "[]"))
+                        .putString("pre_update_backup_country", selectedCountry)
+                        .putLong("pre_update_backup_time", System.currentTimeMillis())
+                        .apply()
+                    UpdateSupport.downloadAndInstall(this, manifest.getString("apkUrl"), remoteName)
+                }
+                .setNegativeButton("بعداً", null).show()
+        }
+    }
+
+    private fun goldFxDialog(index: Int) {
+        val item = assets[index]
+        val rate = EditText(this).apply {
+            hint = "نرخ بازار داخلی هر ۱ دلار به ${currencyLabel(selectedCountry)}"
+            inputType = 8194
+            if (item.usdToLocalRate > 0.0) setText(item.usdToLocalRate.toString())
+        }
+        AlertDialog.Builder(this).setTitle("نرخ دلار داخلی برای محاسبه طلای ۱۸ عیار")
+            .setView(dialogBox(rate))
+            .setPositiveButton("ذخیره نرخ") { _, _ ->
+                val value = parseNumber(rate.text.toString())
+                if (value == null || value <= 0.0) {
+                    toast("نرخ دلار باید عددی و بزرگ‌تر از صفر باشد.")
+                } else {
+                    item.usdToLocalRate = value
+                    item.usdToLocalCountry = selectedCountry
+                    item.positionCountry = selectedCountry
+                    saveAssets(); render()
+                }
+            }.setNegativeButton("لغو", null).show()
+    }
+
+    private fun pnlColor(value: Double) = if (value >= 0) Color.rgb(25, 130, 80) else Color.RED
+
+    private fun addWatchItemDialog() {
+        if (watchlist.size >= 10) { toast("حداکثر ۱۰ مورد را می‌توانید تحت نظر بگیرید."); return }
+        val name = EditText(this).apply { hint = "نام دارایی برای پایش" }
+        val types = arrayOf("طلا و فلزات", "ارز", "خانه / ملک", "خودرو", "سایر")
+        val type = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, types) }
+        AlertDialog.Builder(this).setTitle("افزودن دارایی تحت نظر")
+            .setView(dialogBox(name, type))
+            .setPositiveButton("افزودن") { _, _ ->
+                val clean = name.text.toString().trim()
+                if (clean.isBlank() || watchlist.any { it.name.equals(clean, true) }) toast("نام خالی یا تکراری است.")
+                else {
+                    val selectedType = type.selectedItem.toString()
+                    watchlist.add(WatchItem(clean, selectedType, selectedCountry))
+                    ensureGlobalReference(selectedType, clean)
+                    saveAssets(); render()
+                }
+            }.setNegativeButton("لغو", null).show()
+    }
+
+    private fun addAssetDialog() {
+        if (assets.size >= 10) {
+            toast("حداکثر می‌توانید ۱۰ دارایی ثبت کنید.")
+            return
+        }
+        val name = EditText(this).apply { hint = "نام دارایی (مثلاً طلای ۱۸ عیار یا آپارتمان)" }
+        val types = arrayOf("طلا و فلزات", "ارز", "خانه / ملک", "خودرو", "سایر")
+        val type = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, types) }
+        val box = dialogBox(name, type)
+        AlertDialog.Builder(this).setTitle("افزودن دارایی (حداکثر ۱۰ مورد)").setView(box)
+            .setPositiveButton("افزودن") { _, _ ->
+                val cleanName = name.text.toString().trim()
+                if (cleanName.isNotEmpty() && assets.none { it.name.equals(cleanName, true) }) {
+                    val selectedType = type.selectedItem.toString()
+                    assets.add(AssetItem(cleanName, assetType = selectedType, positionCountry = selectedCountry))
+                    ensureGlobalReference(selectedType, cleanName)
+                    saveAssets(); render()
+                } else toast("نام دارایی خالی است یا قبلاً ثبت شده است.")
+            }.setNegativeButton("لغو", null).show()
+    }
+
+    private fun estimatedValue(item: AssetItem): Double {
+        val base = item.valuationBase
+        val adjustment = 1.0 + (item.valuationAdjustmentPercent / 100.0)
+        if (base <= 0.0 || adjustment <= 0.0) return 0.0
+        return if (item.assetType == "خانه / ملک") {
+            if (item.valuationArea <= 0.0) 0.0 else item.valuationArea * base * adjustment
+        } else if (item.assetType == "خودرو") {
+            base * adjustment
+        } else 0.0
+    }
+
+    private fun valuationDialog(index: Int) {
+        val item = assets[index]
+        val details = EditText(this).apply {
+            hint = if (item.assetType == "خانه / ملک") "شهر، محله، سن بنا، طبقه، امکانات و وضعیت سند" else "برند، مدل، تیپ، سال ساخت، کارکرد و وضعیت بدنه/فنی"
+            setText(item.valuationDetails)
+        }
+        val base = EditText(this).apply {
+            hint = if (item.assetType == "خانه / ملک") "قیمت هر متر مربع ملک مشابه به ${currencyLabel(selectedCountry)}" else "قیمت نمونه مشابه خودرو به ${currencyLabel(selectedCountry)}"
+            inputType = 8194
+            if (item.valuationBase > 0) setText(item.valuationBase.toString())
+        }
+        val area = EditText(this).apply {
+            hint = "متراژ ملک به متر مربع"
+            inputType = 8194
+            if (item.valuationArea > 0) setText(item.valuationArea.toString())
+            visibility = if (item.assetType == "خانه / ملک") View.VISIBLE else View.GONE
+        }
+        val adjustment = EditText(this).apply {
+            hint = "درصد تعدیل نسبت به نمونه مشابه (مثلاً ۵ یا ۵- برای منفی)"
+            inputType = 12290
+            if (item.valuationAdjustmentPercent != 0.0) setText(item.valuationAdjustmentPercent.toString())
+        }
+        AlertDialog.Builder(this).setTitle("ارزش‌گذاری تخمینی ${item.name}")
+            .setView(dialogBox(details, base, area, adjustment))
+            .setPositiveButton("محاسبه و ذخیره") { _, _ ->
+                val b = parseNumber(base.text.toString())
+                val a = if (item.assetType == "خانه / ملک") parseNumber(area.text.toString()) else 1.0
+                val adj = if (adjustment.text.isNullOrBlank()) 0.0 else parseNumber(adjustment.text.toString())
+                if (b == null || b <= 0.0 || a == null || a <= 0.0 || adj == null || adj <= -100.0) {
+                    toast("قیمت پایه، متراژ و درصد تعدیل را درست وارد کنید.")
+                    return@setPositiveButton
+                }
+                item.valuationBase = b
+                item.valuationArea = a
+                item.valuationAdjustmentPercent = adj
+                item.valuationDetails = details.text.toString().trim()
+                item.positionCountry = selectedCountry
+                saveAssets(); render()
+            }.setNegativeButton("لغو", null).show()
+    }
+
+    private fun tradeDialog(index: Int, isBuy: Boolean) {
+        val selectedItem = assets[index]
+        if ((selectedItem.amount > 0.0 || selectedItem.realizedPnl != 0.0) && selectedItem.positionCountry != selectedCountry) {
+            toast("معاملات این دارایی در بازار ${selectedItem.positionCountry} ثبت شده است. برای جلوگیری از مخلوط‌شدن ارزها، کشور را به همان بازار برگردانید.")
+            return
+        }
+        val qty = EditText(this).apply { hint = "مقدار"; inputType = 8194 }
+        val price = EditText(this).apply { hint = "قیمت هر واحد به ${localCurrencyLabel()}"; inputType = 8194 }
+        val box = dialogBox(qty, price)
+        AlertDialog.Builder(this).setTitle(if (isBuy) "ثبت خرید ${assets[index].name}" else "ثبت فروش ${assets[index].name}")
+            .setView(box).setPositiveButton("ثبت") { _, _ ->
+                val q = parseNumber(qty.text.toString())
+                val p = parseNumber(price.text.toString())
+                if (q == null || p == null || q <= 0.0 || p <= 0.0) {
+                    toast("مقدار و قیمت باید عددی و بزرگ‌تر از صفر باشند."); return@setPositiveButton
+                }
+                val item = assets[index]
+                if (!isBuy && q > item.amount) { toast("مقدار فروش از موجودی بیشتر است."); return@setPositiveButton }
+                tradeHistory.add(TradeRecord(item.name, if (isBuy) "BUY" else "SELL", q, p, localCurrencyLabel()))
+                if (isBuy) {
+                    if (item.amount == 0.0 && item.realizedPnl == 0.0) item.positionCountry = selectedCountry
+                    val newAmount = item.amount + q
+                    item.averageBuyPrice = ((item.amount * item.averageBuyPrice) + (q * p)) / newAmount
+                    item.amount = newAmount
+                } else {
+                    item.realizedPnl += q * (p - item.averageBuyPrice)
+                    item.amount -= q
+                    if (item.amount < 0.000000001) item.amount = 0.0
+                }
+                // Trade execution price must not overwrite the independent market quote.
+                saveAssets(); render()
+            }.setNegativeButton("لغو", null).show()
+    }
+
+    private fun priceDialog(index: Int) {
+        val selectedItem = assets[index]
+        if ((selectedItem.amount > 0.0 || selectedItem.realizedPnl != 0.0) && selectedItem.positionCountry != selectedCountry) {
+            toast("این دارایی در بازار ${selectedItem.positionCountry} نگهداری/معامله شده است. برای ثبت قیمت معتبر، همان کشور را انتخاب کنید.")
+            return
+        }
+        val price = EditText(this).apply { hint = "قیمت فعلی هر واحد به ${localCurrencyLabel()}"; inputType = 8194 }
+        AlertDialog.Builder(this).setTitle("به‌روزرسانی قیمت ${assets[index].name}")
+            .setView(dialogBox(price)).setPositiveButton("ثبت قیمت") { _, _ ->
+                val p = parseNumber(price.text.toString())
+                if (p == null || p <= 0.0) toast("قیمت باید عددی و بزرگ‌تر از صفر باشد.")
+                else {
+                    assets[index].currentPrice = p
+                    assets[index].internalSource = "ثبت دستی کاربر"
+                    assets[index].internalCountry = selectedCountry
+                    assets[index].internalUpdatedAt = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("fa", "IR")).format(java.util.Date())
+                    saveAssets(); render()
+                }
+            }.setNegativeButton("لغو", null).show()
+    }
+
+
+    private fun countryDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("کشور بازار داخلی را انتخاب کنید")
+            .setSingleChoiceItems(supportedCountries, supportedCountries.indexOf(selectedCountry).coerceAtLeast(0)) { dialog, which ->
+                selectedCountry = supportedCountries[which]
+                prefs.edit().putString("selected_country", selectedCountry).apply()
+                dialog.dismiss()
+                render()
+                toast("کشور انتخاب شد. قیمت‌های کشور قبلی برای این بازار استفاده نمی‌شوند؛ منبع خودکار هنوز باید متصل شود.")
+            }
+            .setNegativeButton("لغو", null)
+            .show()
+    }
+
+    private fun globalPriceDialog(index: Int) {
+        val value = EditText(this).apply { hint = "مقدار قیمت جهانی"; inputType = 8194 }
+        val currency = EditText(this).apply { hint = "ارز (مثلاً USD)"; setText("USD") }
+        val unit = EditText(this).apply { hint = "واحد (مثلاً هر اونس تروا)"; setText("هر اونس تروا") }
+        val source = EditText(this).apply { hint = "نام مرجع جهانی" }
+        AlertDialog.Builder(this).setTitle("ثبت مرجع جهانی ${assets[index].name}")
+            .setView(dialogBox(value, currency, unit, source))
+            .setPositiveButton("ثبت موقت") { _, _ ->
+                val v = parseNumber(value.text.toString())
+                if (v == null || v <= 0.0 || currency.text.isBlank() || unit.text.isBlank() || source.text.isBlank()) {
+                    toast("قیمت، ارز، واحد و منبع را کامل وارد کنید.")
+                } else {
+                    val item = assets[index]
+                    item.globalPrice = v
+                    item.globalCurrency = currency.text.toString().trim().uppercase(Locale.ROOT)
+                    item.globalUnit = unit.text.toString().trim()
+                    item.globalSource = source.text.toString().trim() + " (ورود دستی؛ تأییدنشده)"
+                    item.globalUpdatedAt = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("fa", "IR")).format(java.util.Date())
+                    saveAssets(); render()
+                }
+            }.setNegativeButton("لغو", null).show()
+    }
+
+    private fun dialogBox(vararg views: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(32, 12, 32, 8)
+        views.forEach { addView(it) }
+    }
+
+    private fun addText(parent: LinearLayout, value: String, size: Int, color: Int, bold: Boolean = false) {
+        parent.addView(TextView(this).apply {
+            text = value
+            textSize = size.toFloat()
+            val themedColor = when (color) {
+                Color.BLACK, Color.DKGRAY -> activeTheme.text
+                Color.GRAY -> if (isLightTheme()) Color.rgb(105, 110, 118) else Color.rgb(190, 190, 190)
+                else -> color
+            }
+            setTextColor(themedColor)
+            gravity = Gravity.RIGHT
+            textDirection = View.TEXT_DIRECTION_RTL
+            if (bold) setTypeface(null, android.graphics.Typeface.BOLD)
+            setPadding(0, 8, 0, 8)
+        })
+    }
+
+    private fun card(block: LinearLayout.() -> Unit) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(18, 12, 18, 12)
+            setBackgroundColor(activeTheme.surface)
+            block()
+        }
+        val params = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 12, 0, 12) }
+        content.addView(box, params)
+    }
+
+    private fun button(label: String, action: () -> Unit) = Button(this).apply {
+        text = label
+        backgroundTintList = android.content.res.ColorStateList.valueOf(activeTheme.accent)
+        setTextColor(if (activeTheme.key == "light") Color.WHITE else Color.rgb(24, 24, 24))
+        setOnClickListener { action() }
+    }
+
+    private fun themeDialog() {
+        val selectedKey = activeTheme.key
+        val adapter = object : android.widget.BaseAdapter() {
+            override fun getCount() = appThemes.size
+            override fun getItem(position: Int) = appThemes[position]
+            override fun getItemId(position: Int) = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup?): View {
+                val theme = appThemes[position]
+                val line = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(16), dp(10), dp(16), dp(10))
+                }
+                line.removeAllViews()
+                val preview = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        setColor(theme.surface)
+                        cornerRadius = dp(8).toFloat()
+                        setStroke(dp(1), theme.accent)
+                    }
+                    setPadding(dp(7), dp(7), dp(7), dp(7))
+                }
+                listOf(theme.background, theme.surface, theme.accent).forEach { shade ->
+                    val swatch = View(this@MainActivity).apply { setBackgroundColor(shade) }
+                    preview.addView(swatch, LinearLayout.LayoutParams(dp(18), dp(25)).apply { marginEnd = dp(4) })
+                }
+                line.addView(preview)
+                val label = TextView(this@MainActivity).apply {
+                    text = theme.title + if (theme.key == selectedKey) "  ✓ انتخاب‌شده" else ""
+                    textSize = 15f
+                    setTextColor(theme.text)
+                    setPadding(dp(14), dp(8), dp(8), dp(8))
+                    gravity = Gravity.CENTER_VERTICAL or Gravity.RIGHT
+                }
+                line.addView(label, LinearLayout.LayoutParams(0, -2, 1f))
+                line.setBackgroundColor(theme.background)
+                return line
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("انتخاب دستی رنگ‌بندی")
+            .setAdapter(adapter) { dialog, which ->
+                prefs.edit().putString("app_theme", appThemes[which].key).apply()
+                dialog.dismiss()
+                render()
+                toast("رنگ‌بندی ذخیره شد.")
+            }
+            .setNegativeButton("بستن", null)
+            .show()
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+}
