@@ -1,3 +1,4 @@
+
 name: Build Android APK and verify install
 
 on:
@@ -209,6 +210,63 @@ jobs:
 
           head -n 10 "$RUNNER_TEMP/apk-badging.txt"
 
+      - name: Prepare emulator test script
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/hamrah-emulator-test.sh" <<'EMULATOR_SCRIPT'
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/hamrah-device-test"
+          LOG="$RUNNER_TEMP/hamrah-device-test/logcat.txt"
+
+          trap 'adb logcat -d > "$LOG" 2>&1 || true' EXIT
+
+          adb wait-for-device
+
+          BOOTED=0
+          for attempt in $(seq 1 60); do
+            BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+            [ "$BOOTED" = "1" ] && break
+            sleep 2
+          done
+
+          if [ "$BOOTED" != "1" ]; then
+            echo "::error::Android emulator did not finish booting"
+            exit 1
+          fi
+
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::APK file not found: $APK_PATH"
+            exit 1
+          fi
+
+          adb install -r "$APK_PATH"
+          adb shell am force-stop com.hamrahsarmaye.app || true
+
+          START_OUTPUT="$(adb shell am start -W -n com.hamrahsarmaye.app/.MainActivity 2>&1)"
+          printf '%s\n' "$START_OUTPUT"
+
+          printf '%s\n' "$START_OUTPUT" | grep -q "Status: ok"
+
+          sleep 12
+          adb shell pidof com.hamrahsarmaye.app
+
+          adb logcat -d -s AndroidRuntime:E \
+            > "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
+
+          if grep -q "FATAL EXCEPTION" \
+            "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"; then
+            echo "::error::App launch produced a fatal exception"
+            cat "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
+            exit 1
+          fi
+
+          echo "INSTALL_AND_LAUNCH_TEST=PASSED" \
+            | tee "$RUNNER_TEMP/hamrah-device-test/result.txt"
+          EMULATOR_SCRIPT
+
+          chmod +x "$RUNNER_TEMP/hamrah-emulator-test.sh"
+
       - name: Install and launch on Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         env:
@@ -221,51 +279,7 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
           disable-animations: true
           emulator-boot-timeout: 900
-          script: |
-            set -euo pipefail
-
-            mkdir -p "$RUNNER_TEMP/hamrah-device-test"
-            LOG="$RUNNER_TEMP/hamrah-device-test/logcat.txt"
-
-            trap 'adb logcat -d > "$LOG" 2>&1 || true' EXIT
-
-            adb wait-for-device
-
-            BOOTED=0
-            for attempt in $(seq 1 60); do
-              BOOTED="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
-              [ "$BOOTED" = "1" ] && break
-              sleep 2
-            done
-
-            if [ "$BOOTED" != "1" ]; then
-              echo "::error::Android emulator did not finish booting"
-              exit 1
-            fi
-
-            adb install -r "$APK_PATH"
-            adb shell am force-stop com.hamrahsarmaye.app || true
-
-            START_OUTPUT="$(adb shell am start -W -n com.hamrahsarmaye.app/.MainActivity 2>&1)"
-            printf '%s\n' "$START_OUTPUT"
-
-            printf '%s\n' "$START_OUTPUT" | grep -q "Status: ok"
-
-            sleep 12
-            adb shell pidof com.hamrahsarmaye.app
-
-            adb logcat -d -s AndroidRuntime:E \
-              > "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
-
-            if grep -q "FATAL EXCEPTION" \
-              "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"; then
-              echo "::error::App launch produced a fatal exception"
-              cat "$RUNNER_TEMP/hamrah-device-test/runtime-errors.txt"
-              exit 1
-            fi
-
-            echo "INSTALL_AND_LAUNCH_TEST=PASSED" \
-              | tee "$RUNNER_TEMP/hamrah-device-test/result.txt"
+          script: bash "$RUNNER_TEMP/hamrah-emulator-test.sh"
 
       - name: Upload APK and test reports
         if: always()
