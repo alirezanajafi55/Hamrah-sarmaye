@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SOURCE_ZIP="hamrah_sarmaye_v0.3.7_source_root_fixed.zip"
+          SOURCE_ZIP="hamrah_sarmaye_v0.3.9_global_catalog_test_source(1).zip"
 
           if [ ! -f "$SOURCE_ZIP" ]; then
             echo "::error::Source ZIP not found: $SOURCE_ZIP"
@@ -190,7 +190,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: hamrah-sarmaye-v0.3.7-debug-apk
+          name: hamrah-sarmaye-v0.3.9-debug-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
