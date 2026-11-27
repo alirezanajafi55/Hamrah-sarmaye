@@ -1,4 +1,3 @@
-
 name: Build Android APK
 
 on:
@@ -8,8 +7,6 @@ on:
       - main
     paths:
       - 'hamrah_sarmaye_v0.4.2_source_restored_features.zip'
-      - 'Logopit_1795673552004.jpg'
-      - 'Polish_۲۰۲۶۱۱۲۶_۱۳۲۳۴۹۳۵۷.jpg'
       - '.github/workflows/build-apk.yml'
 
 permissions:
@@ -33,11 +30,19 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            platforms;android-35
-            build-tools;35.0.0
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          test -n "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          test -x "$SDK_ROOT/build-tools/35.0.0/aapt"
+          test -x "$SDK_ROOT/build-tools/35.0.0/apksigner"
 
       - name: Extract source and detect Gradle
         id: project
@@ -46,7 +51,6 @@ jobs:
           set -euo pipefail
 
           SOURCE_ZIP="hamrah_sarmaye_v0.4.2_source_restored_features.zip"
-
           if [ ! -f "$SOURCE_ZIP" ]; then
             echo "::error::Source ZIP not found: $SOURCE_ZIP"
             ls -lh *.zip || true
@@ -57,7 +61,6 @@ jobs:
           unzip -q "$SOURCE_ZIP" -d source
 
           SETTINGS_FILE="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
-
           if [ -z "$SETTINGS_FILE" ]; then
             echo "::error::Gradle settings file not found"
             find source -maxdepth 5 -type f
@@ -65,13 +68,10 @@ jobs:
           fi
 
           PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-
           test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
           test -f "$PROJECT_DIR/app/build.gradle.kts"
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           export PROJECT_DIR
-
           echo "Project directory: $PROJECT_DIR"
 
           python3 - <<'PY'
@@ -79,12 +79,10 @@ jobs:
 
           root = os.environ["PROJECT_DIR"]
           files = []
-
           for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
               files += glob.glob(os.path.join(root, pattern), recursive=True)
 
           version = None
-
           patterns = [
               r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
               r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
@@ -96,24 +94,19 @@ jobs:
                   content = open(path, encoding="utf-8").read()
               except Exception:
                   continue
-
               for pattern in patterns:
                   match = re.search(pattern, content)
-
                   if match:
                       version = match.group(1)
                       break
-
               if version:
                   break
 
           print("Detected Android Gradle Plugin:", version or "NOT FOUND")
-
           if not version:
               sys.exit("Could not detect Android Gradle Plugin version")
 
           major_minor = ".".join(version.split(".")[:2])
-
           versions = {
               "8.0": "8.0",
               "8.1": "8.0",
@@ -132,99 +125,82 @@ jobs:
           }
 
           gradle = versions.get(major_minor)
-
           if not gradle:
               sys.exit("No configured Gradle version for AGP " + version)
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("gradle_version=" + gradle + "\n")
-
           print("Selected Gradle version:", gradle)
           PY
 
           grep -q 'versionCode = 18' "$PROJECT_DIR/app/build.gradle.kts"
           grep -q 'versionName = "0.4.2-dev"' "$PROJECT_DIR/app/build.gradle.kts"
 
-      - name: Apply the approved user logos
+      - name: Apply the two approved logos and remove old launcher icon references
         shell: bash
         run: |
           set -euo pipefail
-
           python3 -m venv "$RUNNER_TEMP/logo-venv"
           "$RUNNER_TEMP/logo-venv/bin/pip" install --quiet Pillow
-
           python3 - <<'PYLOGO'
           from pathlib import Path
           from PIL import Image
-          import os
+          import os, xml.etree.ElementTree as ET
 
-          root = Path(os.environ["PROJECT_DIR"])
+          project = Path(os.environ["PROJECT_DIR"])
           repo = Path(os.environ["GITHUB_WORKSPACE"])
+          launcher_file = repo / "Polish_۲۰۲۶۱۱۲۶_۱۳۲۳۴۹۳۵۷.jpg"
+          inapp_file = repo / "Logopit_1795673552004.jpg"
+          if not launcher_file.is_file() or not inapp_file.is_file():
+              raise SystemExit("The two approved logo image files are missing from repository root")
 
-          icon_source = repo / "Polish_۲۰۲۶۱۱۲۶_۱۳۲۳۴۹۳۵۷.jpg"
-          in_app_source = repo / "Logopit_1795673552004.jpg"
+          res = project / "app/src/main/res"
+          # In-app logo resource; MainActivity already loads R.drawable.app_logo.
+          inapp_target = res / "drawable-nodpi/app_logo.jpg"
+          inapp_target.parent.mkdir(parents=True, exist_ok=True)
+          with Image.open(inapp_file) as im:
+              im.convert("RGB").save(inapp_target, "JPEG", quality=96, optimize=True)
 
-          if not icon_source.is_file() or not in_app_source.is_file():
-              raise SystemExit(
-                  "Approved logo source images are missing from repository root"
-              )
+          # Launcher artwork is fitted (not stretched/cropped) into adaptive-icon safe area.
+          with Image.open(launcher_file) as im:
+              original = im.convert("RGBA")
+          fg = Image.new("RGBA", (432,432), (0,0,0,0))
+          art = original.copy(); art.thumbnail((288,288), Image.Resampling.LANCZOS)
+          fg.alpha_composite(art, ((432-art.width)//2,(432-art.height)//2))
+          draw = res / "drawable-nodpi"; draw.mkdir(parents=True, exist_ok=True)
+          fg.save(draw / "ic_launcher_foreground.png", optimize=True)
 
-          res = root / "app/src/main/res"
+          for density,size in {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}.items():
+              folder=res/f"mipmap-{density}"; folder.mkdir(parents=True,exist_ok=True)
+              canvas=Image.new("RGBA",(size,size),(16,16,16,255))
+              icon=original.copy(); icon.thumbnail((int(size*.78),int(size*.78)),Image.Resampling.LANCZOS)
+              canvas.alpha_composite(icon,((size-icon.width)//2,(size-icon.height)//2))
+              canvas.save(folder/"ic_launcher.png",optimize=True)
+              canvas.save(folder/"ic_launcher_round.png",optimize=True)
 
-          logo_target = res / "drawable-nodpi/app_logo.jpg"
-          logo_target.parent.mkdir(parents=True, exist_ok=True)
+          anydpi=res/"mipmap-anydpi-v26"; anydpi.mkdir(parents=True,exist_ok=True)
+          xml='''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          '''
+          for name in ("ic_launcher.xml","ic_launcher_round.xml"):
+              (anydpi/name).write_text(xml,encoding="utf-8")
+          values=res/"values"; values.mkdir(parents=True,exist_ok=True)
+          (values/"ic_launcher_background.xml").write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <resources><color name="ic_launcher_background">#101010</color></resources>
+          ''',encoding="utf-8")
 
-          Image.open(in_app_source).convert("RGB").save(
-              logo_target,
-              format="JPEG",
-              quality=95,
-              optimize=True
-          )
-
-          icon = Image.open(icon_source).convert("RGBA")
-
-          for density, size in {
-              "mdpi": 48,
-              "hdpi": 72,
-              "xhdpi": 96,
-              "xxhdpi": 144,
-              "xxxhdpi": 192
-          }.items():
-
-              folder = res / f"mipmap-{density}"
-              folder.mkdir(parents=True, exist_ok=True)
-
-              resized = icon.resize(
-                  (size, size),
-                  Image.Resampling.LANCZOS
-              )
-
-              resized.save(
-                  folder / "ic_launcher.png",
-                  format="PNG",
-                  optimize=True
-              )
-
-              resized.save(
-                  folder / "ic_launcher_round.png",
-                  format="PNG",
-                  optimize=True
-              )
-
-          foreground_dir = res / "mipmap-xxxhdpi"
-          foreground_dir.mkdir(parents=True, exist_ok=True)
-
-          icon.resize(
-              (432, 432),
-              Image.Resampling.LANCZOS
-          ).save(
-              foreground_dir / "ic_launcher_foreground.png",
-              format="PNG",
-              optimize=True
-          )
-
-          print("In-app logo: Logopit_1795673552004.jpg")
-          print("Launcher icon: Polish_۲۰۲۶۱۱۲۶_۱۳۲۳۴۹۳۵۷.jpg")
+          manifest=project/"app/src/main/AndroidManifest.xml"
+          tree=ET.parse(manifest); app=tree.getroot().find("application")
+          if app is None: raise SystemExit("Manifest application element missing")
+          ns="{http://schemas.android.com/apk/res/android}"
+          app.set(ns+"icon","@mipmap/ic_launcher")
+          app.set(ns+"roundIcon","@mipmap/ic_launcher_round")
+          tree.write(manifest,encoding="utf-8",xml_declaration=True)
+          print("Launcher: Polish_۲۰۲۶۱۱۲۶_۱۳۲۳۴۹۳۵۷.jpg")
+          print("In-app: Logopit_1795673552004.jpg")
           PYLOGO
 
       - name: Set up Gradle
@@ -250,13 +226,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
           test -f "$PROJECT_DIR/app/build.gradle.kts"
-
-          grep -q 'applicationId = "com.hamrahsarmaye.app"' \
-            "$PROJECT_DIR/app/build.gradle.kts"
-
+          grep -q 'applicationId = "com.hamrahsarmaye.app"' "$PROJECT_DIR/app/build.gradle.kts"
           echo "Android project and application ID verified."
 
       - name: Build debug APK
@@ -266,7 +238,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           gradle --no-daemon --stacktrace \
             --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
             -PGLOBAL_ASSET_REGISTRY_URL="${GLOBAL_ASSET_REGISTRY_URL:-}" \
@@ -276,25 +247,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
-
           test -s "$APK_PATH"
-
           AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-
           "$APKSIGNER" verify --verbose "$APK_PATH"
-
-          "$AAPT" dump badging "$APK_PATH" \
-            > "$RUNNER_TEMP/hamrah-debug-badging.txt"
-
-          grep -q "package: name='com.hamrahsarmaye.app'" \
-            "$RUNNER_TEMP/hamrah-debug-badging.txt"
-
-          grep -q "launchable-activity:" \
-            "$RUNNER_TEMP/hamrah-debug-badging.txt"
-
+          "$AAPT" dump badging "$APK_PATH" > "$RUNNER_TEMP/hamrah-debug-badging.txt"
+          grep -q "package: name='com.hamrahsarmaye.app'" "$RUNNER_TEMP/hamrah-debug-badging.txt"
+          grep -q "launchable-activity:" "$RUNNER_TEMP/hamrah-debug-badging.txt"
           ls -lh "$APK_PATH"
 
       - name: Check release signing secrets
@@ -307,28 +267,13 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-
-          if [[ -n "$KEYSTORE_B64" &&
-                -n "$KEYSTORE_PASSWORD" &&
-                -n "$KEY_ALIAS" &&
-                -n "$KEY_PASSWORD" ]]; then
-
-            printf '%s' "$KEYSTORE_B64" \
-              | base64 --decode \
-              > "$RUNNER_TEMP/hamrah-release-2026.jks"
-
+          if [[ -n "$KEYSTORE_B64" && -n "$KEYSTORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]]; then
+            printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/hamrah-release-2026.jks"
             test -s "$RUNNER_TEMP/hamrah-release-2026.jks"
-
-            keytool -list \
-              -keystore "$RUNNER_TEMP/hamrah-release-2026.jks" \
-              -storepass "$KEYSTORE_PASSWORD" \
-              -alias "$KEY_ALIAS" >/dev/null
-
+            keytool -list -keystore "$RUNNER_TEMP/hamrah-release-2026.jks" \
+              -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
             echo "available=true" >> "$GITHUB_OUTPUT"
-
-            echo "ANDROID_RELEASE_STORE_FILE=$RUNNER_TEMP/hamrah-release-2026.jks" \
-              >> "$GITHUB_ENV"
-
+            echo "ANDROID_RELEASE_STORE_FILE=$RUNNER_TEMP/hamrah-release-2026.jks" >> "$GITHUB_ENV"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "Release secrets are not configured; debug APK only."
@@ -346,24 +291,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           gradle --no-daemon --stacktrace \
             --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
             -PGLOBAL_ASSET_REGISTRY_URL="${GLOBAL_ASSET_REGISTRY_URL:-}" \
             assembleRelease
-
           APK_PATH="$PWD/app/build/outputs/apk/release/app-release.apk"
-
           test -s "$APK_PATH"
-
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" \
-            verify --verbose --print-certs "$APK_PATH" \
-            > "$RUNNER_TEMP/hamrah-release-cert.txt"
-
-          grep -Eiq \
-            '23b6ee0fa52b826ad83af925277ec1b9f9e48855ca2735a6d313976c2acbf082' \
-            "$RUNNER_TEMP/hamrah-release-cert.txt"
-
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK_PATH" > "$RUNNER_TEMP/hamrah-release-cert.txt"
+          grep -Eiq '23b6ee0fa52b826ad83af925277ec1b9f9e48855ca2735a6d313976c2acbf082' "$RUNNER_TEMP/hamrah-release-cert.txt"
           echo "Release certificate fingerprint verified."
 
       - name: Upload debug APK
