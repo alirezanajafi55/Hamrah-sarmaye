@@ -181,7 +181,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/logo-venv"
           "$RUNNER_TEMP/logo-venv/bin/pip" install --quiet Pillow
 
-          python3 - <<'PYLOGO'
+          "$RUNNER_TEMP/logo-venv/bin/python" - <<'PYLOGO'
           from pathlib import Path
           from PIL import Image
           import os
