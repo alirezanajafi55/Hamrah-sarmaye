@@ -1,1 +1,105 @@
 
+name: Export Version 0.3.7 Source
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Extract reference source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="hamrah_sarmaye_v0.3.7_source_root_fixed.zip"
+          test -f "$ZIP"
+
+          mkdir -p /tmp/hamrah-source
+          unzip -q "$ZIP" -d /tmp/hamrah-source
+
+          test -n "$(find /tmp/hamrah-source -type f -print -quit)"
+
+      - name: Prepare separate source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="source-export-v037"
+
+          git fetch origin main
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git switch -C "$BRANCH" "origin/$BRANCH"
+          else
+            git switch -c "$BRANCH" origin/main
+          fi
+
+          rm -rf exported-source
+          mkdir -p exported-source
+
+          cp -a /tmp/hamrah-source/. exported-source/
+
+      - name: Remove sensitive files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find exported-source -type f \( \
+            -iname "*.jks" -o \
+            -iname "*.keystore" -o \
+            -iname "*.p12" -o \
+            -iname "*.pfx" -o \
+            -iname "*.pem" -o \
+            -iname "*.key" -o \
+            -iname "local.properties" -o \
+            -iname "key.properties" -o \
+            -iname "keystore.properties" -o \
+            -iname "signing-credentials.txt" -o \
+            -iname "verification.txt" -o \
+            -iname ".env" -o \
+            -iname ".env.*" \
+          \) -delete
+
+          find exported-source -type d \( \
+            -name ".git" -o \
+            -name ".gradle" -o \
+            -name "build" \
+          \) -prune -exec rm -rf {} +
+
+      - name: Publish extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -A exported-source
+
+          if git diff --cached --quiet; then
+            echo "No source changes to publish."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Export original version 0.3.7 source"
+          git push origin source-export-v037
+
+      - name: Report result
+        run: |
+          echo "Source export workflow completed."
+          echo "Branch: source-export-v037"
+          echo "Folder: exported-source/"
