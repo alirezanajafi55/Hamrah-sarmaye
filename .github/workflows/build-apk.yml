@@ -1,13 +1,3 @@
-Skip to content
-Hamrah-sarmaye
-Repository navigation
-Code
-Issues
-Pull requests
-Build Android APK
-Update build-apk.yml #55
-Workflow file for this run
-.github/workflows/build-apk.yml at bdeeb23
 
 name: Build Android APK
 
@@ -41,56 +31,76 @@ jobs:
         with:
           packages: |
             platform-tools
+
       - name: Extract source and detect Gradle
         id: project
         shell: bash
         run: |
           set -euo pipefail
+
           SOURCE_ZIP="hamrah_sarmaye_v0.3.7_source_root_fixed.zip"
+
           if [ ! -f "$SOURCE_ZIP" ]; then
             echo "::error::Source ZIP not found: $SOURCE_ZIP"
             ls -lh *.zip || true
             exit 1
           fi
+
           mkdir -p source
           unzip -q "$SOURCE_ZIP" -d source
+
           PROJECT_DIR="$(find source -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1)"
+
           if [ -z "$PROJECT_DIR" ]; then
             echo "::error::Gradle settings file not found"
             find source -maxdepth 5 -type f
             exit 1
           fi
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           export PROJECT_DIR
+
           echo "Project directory: $PROJECT_DIR"
+
           python3 - <<'PY'
           import os, re, glob, sys
+
           root = os.environ["PROJECT_DIR"]
           files = []
+
           for pattern in ("**/*.gradle", "**/*.gradle.kts", "**/*.toml"):
               files += glob.glob(os.path.join(root, pattern), recursive=True)
+
           version = None
+
           patterns = [
               r'\bagp\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
               r'\b(?:androidGradlePlugin|agpVersion)\s*=\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
               r'com\.android\.(?:application|library)[\s\S]{0,150}?version\s*["\'](\d+\.\d+(?:\.\d+)?)["\']'
           ]
+
           for path in files:
               try:
                   content = open(path, encoding="utf-8").read()
               except Exception:
                   continue
+
               for pattern in patterns:
                   match = re.search(pattern, content)
                   if match:
                       version = match.group(1)
                       break
+
               if version:
                   break
+
           print("Detected Android Gradle Plugin:", version or "NOT FOUND")
+
           if not version:
               sys.exit("Could not detect Android Gradle Plugin version")
+
           major_minor = ".".join(version.split(".")[:2])
+
           versions = {
               "8.0": "8.0",
               "8.1": "8.0",
@@ -107,13 +117,18 @@ jobs:
               "8.12": "8.13",
               "8.13": "8.13"
           }
+
           gradle = versions.get(major_minor)
+
           if not gradle:
               sys.exit("No configured Gradle version for AGP " + version)
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("gradle_version=" + gradle + "\n")
+
           print("Selected Gradle version:", gradle)
           PY
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -132,34 +147,46 @@ jobs:
               }
           }
           EOF
+
       - name: Verify Android project
         shell: bash
         run: |
           set -euo pipefail
+
           test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
           test -f "$PROJECT_DIR/app/build.gradle.kts" || test -f "$PROJECT_DIR/app/build.gradle"
+
           echo "Android project structure verified."
+
       - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
+
           gradle --no-daemon \
             --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
             clean assembleDebug
+
       - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
+
           APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug"
+
           find "$APK_PATH" -maxdepth 1 -type f -name "*.apk" -print
+
           APK_FILE="$(find "$APK_PATH" -maxdepth 1 -type f -name "*.apk" | head -1)"
+
           if [ -z "$APK_FILE" ]; then
             echo "::error::APK file was not generated"
             exit 1
           fi
+
           echo "APK successfully generated:"
           ls -lh "$APK_FILE"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
