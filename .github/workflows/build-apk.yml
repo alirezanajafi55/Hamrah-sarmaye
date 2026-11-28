@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   build:
+    name: Build APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -37,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SOURCE_ZIP="hamrah_sarmaye_v0.4.2_logo_sdk_fixed_source.zip"
+          SOURCE_ZIP="hamrah_sarmaye_v0.3.7_source_root_fixed.zip"
 
           if [ ! -f "$SOURCE_ZIP" ]; then
             echo "::error::Source ZIP not found: $SOURCE_ZIP"
@@ -151,8 +152,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
           test -f "$PROJECT_DIR/app/build.gradle.kts" || test -f "$PROJECT_DIR/app/build.gradle"
+
           echo "Android project structure verified."
 
       - name: Build debug APK
@@ -160,14 +163,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           gradle --no-daemon \
             --init-script "$RUNNER_TEMP/hamrah-jvm-target.init.gradle" \
             clean assembleDebug
 
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug"
+
+          find "$APK_PATH" -maxdepth 1 -type f -name "*.apk" -print
+
+          APK_FILE="$(find "$APK_PATH" -maxdepth 1 -type f -name "*.apk" | head -1)"
+
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::APK file was not generated"
+            exit 1
+          fi
+
+          echo "APK successfully generated:"
+          ls -lh "$APK_FILE"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: hamrah-sarmaye-v0.4.2-debug-apk
+          name: hamrah-sarmaye-v0.3.7-debug-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
